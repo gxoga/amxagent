@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 The amxagent authors
+# Codex CLI configuration for the local SGLang backend.
+# Copy to ~/.codex/config.toml and adjust `model` to match your downloaded snapshot.
+
+model = "{{MODEL}}"
+model_provider = "local-sglang"
+model_context_window = 32768
+
+[model_providers.local-sglang]
+name = "Local SGLang via Responses-API proxy"
+base_url = "http://localhost:8001/v1"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+# CPU inference: a large prompt (e.g. operator reads docs/mdp-options.txt, ~3700
+# lines) can take >5 min to prefill before the first SSE token. The default SSE
+# idle timeout is 300_000 ms (5 min) -> "idle timeout waiting for SSE" disconnects.
+# Give prefill plenty of headroom and a few extra reconnects.
+stream_idle_timeout_ms = 1_200_000
+stream_max_retries = 8
+request_max_retries = 6

@@ -1,0 +1,32 @@
+; npt.mdp - NPT equilibration, ~20 ps (fixed template — change only named parameters)
+integrator           = md
+nsteps               = 10000          ; 20 ps @ dt=0.002
+dt                   = 0.002
+; output control
+nstenergy            = 500
+nstlog               = 500
+; neighbor search / electrostatics
+cutoff-scheme        = Verlet
+coulombtype          = PME
+rcoulomb             = 1.0
+rvdw                 = 1.0
+pbc                  = xyz
+; bond constraints
+constraints          = h-bonds
+constraint-algorithm = lincs
+; temperature coupling
+tcoupl               = V-rescale
+tc-grps              = Protein Non-Protein
+tau_t                = 0.1     0.1
+ref_t                = 300     300
+; pressure coupling
+pcoupl               = Parrinello-Rahman
+pcoupltype           = isotropic
+tau_p                = 2.0
+ref_p                = 1.0
+compressibility      = 4.5e-5
+; continue from NVT (velocities present)
+gen_vel              = no
+continuation         = yes
+; keep protein restrained during NPT
+define               = -DPOSRES

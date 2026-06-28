@@ -1,0 +1,277 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 The amxagent authors
+
+%files
+    responses_proxy.py        /opt/amxagent/responses_proxy.py
+    start_sglang.sh           /opt/amxagent/bin/start_sglang.sh
+    start_codex.sh            /opt/amxagent/bin/start_codex.sh
+    run_bench.sh              /opt/amxagent/bin/run_bench.sh
+    config.toml.template      /opt/amxagent/config.toml.template
+    sglang-gemma4-cpu.patch   /opt/amxagent/sglang-gemma4-cpu.patch
+    bench/llm_amx_benchmark.py /opt/amxagent/bench/llm_amx_benchmark.py
+    bench/run_llm_bench.sh    /opt/amxagent/bench/run_llm_bench.sh
+    # License / redistribution docs shipped inside the image (see REDISTRIBUTION.md).
+    LICENSE                   /usr/share/amxagent/licenses/LICENSE
+    THIRD_PARTY_NOTICES.md    /usr/share/amxagent/licenses/THIRD_PARTY_NOTICES.md
+    REDISTRIBUTION.md         /usr/share/amxagent/licenses/REDISTRIBUTION.md
+    tools/collect_licenses.py /opt/amxagent/tools/collect_licenses.py
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    export HOME=/root
+
+    # ------------------------------------------------------------------
+    # 1. Base apt packages
+    # ------------------------------------------------------------------
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential cmake pkg-config curl git ca-certificates \
+        python3 python3-venv python3-dev \
+        numactl libnuma-dev psmisc \
+        libtcmalloc-minimal4 libtbbmalloc2 libtbb-dev google-perftools \
+        protobuf-compiler \
+        libssl-dev libcap-dev libseccomp-dev
+
+    # ------------------------------------------------------------------
+    # 2. Rust toolchain — needed only for codex build, removed afterwards.
+    #    Idempotent: skip if cargo already present (resume via -u/--update).
+    # ------------------------------------------------------------------
+    # Rust + codex are needed together and only while codex is missing. Once
+    # the binary exists (and the final cleanup has removed .cargo), this whole
+    # block is skipped, so re-running with -u/--update never reinstalls Rust.
+    if [ ! -x /usr/local/bin/codex ]; then
+        if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.94.0 --profile minimal
+        fi
+        . "$HOME/.cargo/env"
+
+        # ------------------------------------------------------------------
+        # 3. Clone + build codex CLI (pinned). RESUMABLE:
+        #      - clone skipped if .git already present
+        #      - cargo build is incremental — target/ persists in the sandbox,
+        #        so a killed build continues instead of restarting
+        #    target/ + cargo are removed in the final cleanup (section 9), not
+        #    here, so a later-stage failure can still resume.
+        # ------------------------------------------------------------------
+        cd /opt/amxagent
+        [ -d codex/.git ] || git clone https://github.com/openai/codex.git codex
+        cd codex
+        git checkout 520ed724d2f598999b5e1cd330ab130ff9b3ffbd
+        cd codex-rs
+        cargo build --release --bin codex
+        install -m 0755 target/release/codex /usr/local/bin/codex
+        cd /opt/amxagent
+    fi
+
+    # ------------------------------------------------------------------
+    # 4. Clone sglang + apply Gemma 4 CPU patch (pinned). Re-entrant:
+    #    clone only if absent; checkout/patch only while .git present (the
+    #    final cleanup removes .git, so a post-success -u just skips this).
+    # ------------------------------------------------------------------
+    cd /opt/amxagent
+    [ -d sglang ] || git clone https://github.com/sgl-project/sglang.git sglang
+    if [ -d sglang/.git ]; then
+        cd sglang
+        git checkout 3c3f0bd55e40b83043f17da469fed15d783fe745
+        PATCH=/opt/amxagent/sglang-gemma4-cpu.patch
+        if git apply --reverse --check "$PATCH" 2>/dev/null; then
+            echo "gemma4 patch already applied — skipping"
+        elif git apply --check "$PATCH" 2>/dev/null; then
+            git apply "$PATCH"
+        else
+            echo "ERROR: gemma4 patch does not apply cleanly"; exit 1
+        fi
+    else
+        echo "sglang/.git absent (post-cleanup) — assuming already built & patched"
+    fi
+
+    # ------------------------------------------------------------------
+    # 5. Python venv + uv with CPU index (so triton/torch resolve to CPU).
+    #    Idempotent: venv/uv/torch each created only if missing.
+    # ------------------------------------------------------------------
+    cd /opt/amxagent
+    [ -d venv ] || python3 -m venv venv
+    . venv/bin/activate
+    command -v uv >/dev/null 2>&1 || { pip install --upgrade pip setuptools wheel; pip install uv; }
+
+    mkdir -p "$HOME/.config/uv"
+    cat > "$HOME/.config/uv/uv.toml" <<'TOML'
+[[index]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cpu"
+[[index]]
+name = "triton"
+url = "https://download.pytorch.org/whl/cpu"
+TOML
+
+    # Pre-install torch first so sgl-kernel C++ build sees it (idempotent)
+    python -c "import torch" 2>/dev/null || uv pip install "torch==2.9.0"
+
+    # ------------------------------------------------------------------
+    # 6. Build sgl-kernel-cpu (C++ kernels, needs protoc + torch). Idempotent.
+    # ------------------------------------------------------------------
+    export PROTOC="$(command -v protoc)"
+    if ! python -c "import sgl_kernel" 2>/dev/null; then
+        cd /opt/amxagent/sglang/sgl-kernel
+        cp pyproject_cpu.toml pyproject.toml
+        uv pip install .
+    fi
+
+    # ------------------------------------------------------------------
+    # 7. Build sglang Python (resolves orjson/uvloop/pyzmq/etc via uv). Idempotent.
+    # ------------------------------------------------------------------
+    if ! python -c "import sglang.srt" 2>/dev/null; then
+        cd /opt/amxagent/sglang/python
+        cp pyproject_cpu.toml pyproject.toml
+        uv pip install .
+    fi
+
+    # ------------------------------------------------------------------
+    # 8. Proxy runtime deps (fastapi etc — may already be pulled, idempotent)
+    # ------------------------------------------------------------------
+    uv pip install fastapi uvicorn httpx openai huggingface_hub psutil
+
+    # ------------------------------------------------------------------
+    # 8b. Collect third-party license texts INTO the image. REQUIRED for SIF
+    #     redistribution — this is a compliance step, so the build FAILS if the
+    #     bundle is not produced (no `|| true`). Runs with the venv python so it
+    #     sees every installed distribution. See REDISTRIBUTION.md.
+    # ------------------------------------------------------------------
+    LIC_COLLECTED=/usr/share/amxagent/licenses/collected
+    python /opt/amxagent/tools/collect_licenses.py "${LIC_COLLECTED}" \
+        --src /opt/amxagent/codex --src /opt/amxagent/sglang
+    # Verify the bundle the docs promise actually exists before continuing.
+    test -s "${LIC_COLLECTED}/MANIFEST.txt"        || { echo "ERROR: license MANIFEST missing/empty"; exit 1; }
+    ls "${LIC_COLLECTED}"/source/codex/*  >/dev/null 2>&1 || { echo "ERROR: codex license not collected"; exit 1; }
+    ls "${LIC_COLLECTED}"/source/sglang/* >/dev/null 2>&1 || { echo "ERROR: sglang license not collected"; exit 1; }
+    ls -d "${LIC_COLLECTED}"/python/*/    >/dev/null 2>&1 || { echo "ERROR: no python license dirs collected"; exit 1; }
+    echo "license bundle OK: $(grep -c '^python' "${LIC_COLLECTED}/MANIFEST.txt") python distributions"
+
+    # ------------------------------------------------------------------
+    # 9. Cleanup to shrink image
+    # ------------------------------------------------------------------
+    # NOTE: do NOT rm -rf /tmp/* — under --fakeroot the host /tmp is shared,
+    # so it hits root-owned files and busy mountpoints, returns non-zero, and
+    # aborts the whole build. Clean only our own dirs, and keep it non-fatal.
+    #
+    # This runs LAST, so reaching it means every build step succeeded. Only
+    # then is it safe to drop the Rust toolchain + cargo target/ (the resume
+    # cache). A killed run never reaches here, so resume artifacts survive.
+    # Keep /usr/share/doc — it holds the base-distro package licenses that a
+    # redistributed .sif must carry (see REDISTRIBUTION.md). Do NOT delete it.
+    rm -rf "$HOME/.cache" \
+           /opt/amxagent/codex/codex-rs/target "$HOME/.cargo" "$HOME/.rustup" \
+           /opt/amxagent/sglang/.git \
+           /opt/amxagent/codex/.git \
+           /var/lib/apt/lists/* || true
+
+    chmod +x /opt/amxagent/bin/*.sh
+
+    # Render codex config template — model path resolved at runtime via env
+    install -d /opt/amxagent/share
+    cp /opt/amxagent/config.toml.template /opt/amxagent/share/config.toml.template
+
+%environment
+    # Content files (codex rollout/state, generated artifacts, logs) owner-only —
+    # they hold prompts/commands/outputs; keep co-tenants on shared nodes out.
+    umask 077
+    export PATH="/opt/amxagent/venv/bin:/usr/local/bin:$PATH"
+    export SGLANG_USE_CPU_ENGINE=1
+    export SGLANG_NATIVE_MOVE_KV_CACHE=1
+    export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
+    # Override-able runtime knobs
+    export MODEL="${MODEL:-/models}"
+    export VENV="/opt/amxagent/venv"
+    export LOG_DIR="${LOG_DIR:-/tmp}"
+    export TP_SIZE="${TP_SIZE:-4}"
+    export PORT_BACKEND="${PORT_BACKEND:-8000}"
+    export PORT_PROXY="${PORT_PROXY:-8001}"
+    export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
+
+%runscript
+    cat <<EOF
+amxagent.sif — codex CLI + SGLang CPU + Responses-API proxy (Gemma 4 A4B-it)
+
+Apps (use 'apptainer run --app <name> amxagent.sif ...'):
+  sglang    Start SGLang backend + proxy. Bind a model dir to /models.
+  codex     Run codex CLI (backend must already be up)
+  bench     One-shot non-interactive run: start backend -> codex exec <prompt> -> stop.
+            Prompt via arg or BENCH_PROMPT / BENCH_PROMPT_FILE.
+  llmbench  All-core AMX LLM throughput benchmark (ensure backend -> concurrency
+            sweep -> prefill/decode tok/s + aggregate + per-core CPU). Bind /models.
+  proxy     Run only the responses_proxy (against an existing backend)
+  shell     Open a venv-activated shell inside the container
+
+Typical session:
+  apptainer run --bind /host/path/to/gemma-4-a4b-it:/models \\
+      --app sglang amxagent.sif start
+  # in another terminal
+  apptainer run --app codex amxagent.sif
+
+Stop:
+  apptainer run --app sglang amxagent.sif stop
+
+Env overrides (export APPTAINERENV_<NAME>=...):
+  MODEL (default /models)  TP_SIZE (4)
+  PORT_BACKEND (8000)      PORT_PROXY (8001)
+  CHUNKED_PREFILL_SIZE (2048)
+
+Licenses (this image redistributes third-party software — see REDISTRIBUTION.md):
+  /usr/share/amxagent/licenses/            LICENSE, THIRD_PARTY_NOTICES.md, REDISTRIBUTION.md
+  /usr/share/amxagent/licenses/collected/  per-package texts + MANIFEST.txt
+  /usr/share/doc/                          base-distro package licenses
+EOF
+
+%apprun sglang
+    exec /opt/amxagent/bin/start_sglang.sh "${@:-start}"
+
+%apprun codex
+    exec /opt/amxagent/bin/start_codex.sh "$@"
+
+%apprun bench
+    # Full non-interactive lifecycle: start backend -> codex exec <prompt> -> stop.
+    # Prompt via arg, $BENCH_PROMPT, or $BENCH_PROMPT_FILE. This is the non-interactive
+    # batch model — no foreground keepalive, no TUI.
+    exec /opt/amxagent/bin/run_bench.sh "$@"
+
+%apprun llmbench
+    # All-core AMX LLM throughput benchmark: ensure backend -> sweep concurrency
+    # -> report prefill/decode tok/s + aggregate throughput + per-core CPU usage.
+    exec bash /opt/amxagent/bench/run_llm_bench.sh "$@"
+
+%apprun proxy
+    AUTH_HOME="${HOME:-/tmp}"
+    AUTH_TOKEN_FILE="${AMXAGENT_AUTH_FILE:-${AUTH_HOME}/.codex/amxagent_proxy.key}"
+    if [ "${AMXAGENT_REQUIRE_AUTH:-1}" != "0" ]; then
+        mkdir -p "$(dirname "${AUTH_TOKEN_FILE}")"
+        if [ -n "${OPENAI_API_KEY:-}" ] && [ "${OPENAI_API_KEY}" != "dummy" ]; then
+            export PROXY_API_KEY="${OPENAI_API_KEY}"
+        elif [ -s "${AUTH_TOKEN_FILE}" ]; then
+            export PROXY_API_KEY="$(cat "${AUTH_TOKEN_FILE}")"
+        else
+            export PROXY_API_KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+            umask 077
+            printf '%s' "${PROXY_API_KEY}" > "${AUTH_TOKEN_FILE}"
+            chmod 600 "${AUTH_TOKEN_FILE}" 2>/dev/null || true
+        fi
+        export OPENAI_API_KEY="${PROXY_API_KEY}"
+    else
+        unset PROXY_API_KEY
+    fi
+    exec python /opt/amxagent/responses_proxy.py \
+        --port "${PORT_PROXY}" \
+        --backend "http://localhost:${PORT_BACKEND}"
+
+%apprun shell
+    exec /bin/bash --login
+
+%labels
+    Maintainer amxagent
+    Description codex + SGLang CPU (Gemma 4 A4B-it) bundle
+    SGLangCommit 3c3f0bd55e40b83043f17da469fed15d783fe745
+    CodexCommit 520ed724d2f598999b5e1cd330ab130ff9b3ffbd

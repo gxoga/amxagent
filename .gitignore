@@ -1,0 +1,47 @@
+# Build output — regenerable from amxagent.def (apptainer build)
+amxagent.sif
+amxagent.sif.old
+amxagent-sb/
+
+# Upstream source clones — re-cloned at the pinned commits recorded in amxagent.def
+sglang/
+codex/
+
+# Python venv + downloaded model snapshots (bind-mounted at runtime)
+venv/
+models/
+gemma-4-26B-A4B-it/
+__pycache__/
+*.pyc
+
+# Runtime / test artifacts
+*.log
+benchwork*/
+.codex/
+
+# GROMACS docs are regenerated on-site from the installed GROMACS
+# (examples/gromacs/gromacs_work/gen_docs.sh) — never ship third-party docs.
+examples/gromacs/gromacs_work/docs/
+
+# GROMACS run artifacts — only *.mdp, run_md.sh, AGENTS.md, gen_docs.sh are source.
+# Inputs (PDB) and all simulation outputs are regenerated on-site.
+examples/gromacs/gromacs_work/*.pdb
+examples/gromacs/gromacs_work/*.gro
+examples/gromacs/gromacs_work/*.edr
+examples/gromacs/gromacs_work/*.tpr
+examples/gromacs/gromacs_work/*.trr
+examples/gromacs/gromacs_work/*.xtc
+examples/gromacs/gromacs_work/*.cpt
+examples/gromacs/gromacs_work/*.xvg
+examples/gromacs/gromacs_work/*.top
+examples/gromacs/gromacs_work/*.itp
+examples/gromacs/gromacs_work/*.ndx
+examples/gromacs/gromacs_work/mdout.mdp
+examples/gromacs/gromacs_work/*_history.tsv
+examples/gromacs/gromacs_work/codex_*.txt
+examples/gromacs/gromacs_work/mobj_iter_*/
+examples/gromacs/gromacs_work/runs/
+examples/gromacs/gromacs_work/\#*\#
+
+# local environment overrides (not tracked)
+amxagent_env.sh

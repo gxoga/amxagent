@@ -1,0 +1,3 @@
+Write a Python script fib.py that computes the 30th Fibonacci number using an
+iterative loop (no recursion), then run it with python3 and report the printed
+result. Keep the script under 15 lines.
